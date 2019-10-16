@@ -3,6 +3,16 @@ uuid = "5f0d5817-4832-40b1-a15e-e90794c1bce0"
 authors = ["Allen Hill <allenofthehills@gmail.com>"]
 version = "0.1.0"
 
+[deps]
+Biomechanics = "6f07b801-2c6f-57cd-b605-0571f3a6b84e"
+DSP = "717857b8-e6f2-59f4-9121-6e50c889abd2"
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+DelimitedFiles = "8bb1440f-4735-579b-a4ab-409b98df4dab"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+MAT = "23992714-dd62-5051-b70f-ba57cb901cac"
+StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
+
 [compat]
 julia = "1"
 

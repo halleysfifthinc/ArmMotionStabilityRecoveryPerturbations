@@ -1,5 +1,473 @@
 module ArmMotionStabilityRecoveryPerturbations
 
-greet() = print("Hello World!")
+using Biomechanics, MAT, DSP, StaticArrays
+
+# Standard library
+using Statistics, LinearAlgebra, Dates, DelimitedFiles
+
+export readsegment,
+       readperturbations,
+       analyzetrial
+
+export DSPerturb,
+       PerturbSeg
+
+abstract type DSPerturb <: AbstractDataSource end
+
+struct PerturbSeg <: DSPerturb
+    events::Dict{Symbol,Vector{Float64}}
+    data::Dict{Symbol,Matrix{Float64}}
+end
+
+PerturbSeg() = PerturbSeg(Dict{Symbol,Matrix}(), Dict{Symbol,AbstractVector}())
+
+function readsegment(DSData::Type{<:AbstractDataSource},
+                     trial::Trial{<:AbstractDataSource},
+                     st::Float64 = 0.0,
+                     en::Float64 = Inf;
+                     events::Vector = [],
+                     ts::Vector = [],
+                     fs = 100)
+    isfile(trial.path) || throw(ArgumentError("trial $(trial.path) exist"))
+    st >= 0.0 || throw(ArgumentError("start time must be positive"))
+    st <= en || throw(ArgumentError("end time must be greater than start time"))
+
+    evnames = Symbol.(events)
+    file = matopen(trial.path)
+
+    revents = Dict{Symbol,Vector{Float64}}()
+    for e in events
+        if exists(file, string(e))
+            syme = Symbol(e)
+            tmp = read(file, string(e))[1]
+            if tmp isa AbstractArray
+                revents[syme] = vec(tmp)
+            else
+                revents[syme] = [tmp]
+            end
+            strt = findfirst(x -> x >= st, revents[syme])
+            if strt == 0
+                # @warn "no $e events during given start and end times"
+                delete!(revents, syme)
+                break
+            end
+            endi = findlast(x -> x <= en, revents[syme])
+            revents[syme] = revents[syme][strt:endi] .- st .+ (1/fs) # Shift events to be index accurate for data subsection
+        else
+            # @warn "Requested event $e does not exist in source data"
+        end
+    end
+
+    data = Dict{Symbol,Matrix{Float64}}()
+    for t in ts
+        if exists(file, string(t))
+            symt = Symbol(t)
+            data[symt] = read(file, string(t))[1]
+            len = size(data[symt], 1)
+            strti = round(Int, st*fs)
+            endi = en == Inf ? len : min(len, round(Int, en*fs))
+            data[symt] = data[symt][strti:endi, :]
+        else
+            @warn "Requested time series $t does not exist in source data"
+        end
+    end
+
+    return Segment(trial, Dict{Symbol,Any}(), DSData(revents, data))
+end
+
+const fs = 100
+
+function readperturbations(rootdir::String, subs=1:15, analysis="")
+    genV3D = joinpath(rootdir, "data", "generated", "ARMS_STAB")
+    raw3D = joinpath(rootdir, "data", "raw", "ARMS_STAB")
+
+    trialnames = [  "trip",
+                    "slip",
+                    "perturb"]
+
+    allperts = Vector{Segment}()
+
+    for sub in subs
+        perts = Vector{Segment}()
+
+        subj = lpad(sub, 2, '0')
+        pfiles = readdir(joinpath(genV3D, "Subject $subj", "import", "pert-events"))
+        filter!(pfiles) do file
+            endswith(file,".tsv") && mapreduce(x -> occursin(x,file),|, trialnames)
+        end
+
+        torder = getsessionorder(joinpath(raw3D, "Subject $subj", "_"))
+
+        for trial in pfiles
+            trialnumber = findfirst(x -> occursin(x, trial), torder)
+
+            # Setup arrays
+            trialname = Vector{String}()
+            ptype = Vector{Symbol}()
+            longterm = Vector{Bool}()
+            trialpnumber = Vector{Int}()
+            pst = Vector{Float64}()
+            pen = Vector{Float64}()
+
+            events = readdlm(joinpath(genV3D, "Subject $subj", "import", "pert-events", trial), '\t')
+
+            # Symmetry condition will be the same for all perturbations in a trial
+            sym = (occursin("asym", trial) ? :asym : :sym)
+            if occursin("norm", trial)
+                arms = :norm
+            elseif occursin("tied", trial) || occursin("none", trial)
+                arms = :tied
+            elseif occursin("noswing", trial) || occursin("released", trial)
+                arms = :noswing
+            else
+                warn(sub, ", ", trial, "Incorrect/missing arm condition in filename")
+                continue
+            end
+
+            if occursin("perturb", trial)
+                # Check that events file is the correct size (ie if it is the correct size
+                # then it should be a complete events file)
+                try
+                    @assert size(events) == (9,5)
+                catch
+                    warn(sub, ", ", trial, "Bad events file")
+                    continue
+                end
+
+                # Go through all 8 perturbations
+                for i in [2,4], j in 6:9
+                    # Check what kind of perturbation it is; warn and skip if bad file
+                    # N.B. I have no clue how that could happen since the events file is
+                    # generated by a script, however, it doesn't hurt to be careful
+                    if events[2,i] == "TRST"
+                        push!(ptype, :trip)
+                    elseif events[2,i] == "SLST"
+                        push!(ptype, :slip)
+                    else
+                        warn(sub, ", ", trial, "Event name typo")
+                        continue
+                    end
+
+                    # Add pertubation info to arrays
+                    push!(trialname, split(trial,".")[1])
+                    push!(longterm, false)
+                    push!(pst, events[j,i])
+                    push!(pen, events[j,i+1])
+                end
+
+                # Sort them by pst to get ordered indices of the perturbations,
+                # then sort the indices to get the correct perturbation numbers
+                porder = sortperm(sortperm(pst))
+                # Use the indices returned as the trialpnumber, this works because the
+                # range of indices will be equal to the number of trials, and the sorted
+                # order
+                append!(trialpnumber, porder)
+            else
+                # Check that events file is the correct size (ie if it is the correct size
+                # then it should be a complete events file)
+                try
+                    @assert size(events) == (6,3)
+                catch
+                    warn(sub, ", ", trial, "Bad events file")
+                    continue
+                end
+
+                # Check what kind of perturbation it is; warn and skip if bad file
+                # N.B. I have no clue how that could happen since the events file is
+                # generated by a script, however, it doesn't hurt to be careful
+                if events[2,2] == "TRST"
+                    push!(ptype, :trip)
+                elseif events[2,2] == "SLST"
+                    push!(ptype, :slip)
+                else
+                    warn(sub, ", ", trial, "Event name typo")
+                    continue
+                end
+
+                push!(trialname, split(trial,".")[1])
+                push!(longterm, true)
+
+                push!(trialpnumber, 1)
+
+                push!(pst, events[6,2])
+                push!(pen, events[6,3])
+            end
+
+            # Double check that everything is the same length
+            # (No clue how they wouldn't be, but it doesn't hurt to check)
+            @assert length(trialname) == length(ptype)
+            @assert length(ptype) == length(longterm) == length(pen)
+            @assert length(pen) == length(trialpnumber) == length(pst)
+
+            # Mostly initialize the PerturbSeg (we don't know at this point what the number
+            # and type of previous perturbations were)
+            for i = 1:length(trialname)
+                p = joinpath(genV3D, "Subject $subj", "export", "perturbations", trialname[i]*analysis*".mat")
+                conds = Dict{Symbol,Any}(:ptype => ptype[i],
+                             :sym => sym,
+                             :arms => arms,
+                             :trialnum => trialnumber)
+                pertinfo = Dict{Symbol,Any}(:longterm => longterm[i],
+                                :overallpnumber => 0,
+                                :specificpnumber => 0,
+                                :trialpnumber => trialpnumber[i],
+                                :pst => pst[i],
+                                :pen => pen[i])
+
+                push!(perts, Segment(Trial{DSPerturb}(sub, trialname[i], p, conds),
+                                     pertinfo, PerturbSeg()))
+            end
+        end
+
+        # Now that we have all the perturbations, sort them by trial number to count the
+        # number and types of past perturbations
+        sorted = sortperm(perts, by=(x -> x.trial.conds[:trialnum]) )
+        currperturb = 0
+        currtrip = 0
+        currslip = 0
+
+        # Update each PerturbSeg with the correct overallpnumber and specificpnumber
+        for trial in sorted
+            perts[trial].conds[:overallpnumber] = (currperturb += 1)
+            perts[trial].conds[:specificpnumber] = ((perts[trial].trial.conds[:ptype] == :trip) ? (currtrip += 1) : (currslip += 1))
+        end
+
+        append!(allperts, perts)
+    end
+
+    return allperts
+end
+
+function getsessionorder(session::String)
+    isabspath(session) || throw(ArgumentError("path must be absolute"))
+    isdir(session) || throw(ArgumentError("path must be to a directory"))
+
+    badenfs = Vector{Int}()
+    trialctime = Vector{DateTime}()
+    df = DateFormat("y,m,d,H,M,S")
+
+    trials = readdir(session)
+    filter!(file -> endswith(file,"Trial.enf"), trials)
+
+    for trialnum in eachindex(trials)
+        file = read(joinpath(session, trials[trialnum]), String)
+        m = match(r"CREATIONDATEANDTIME\=(?<timestring>.*)\r", file)
+
+        if m === nothing
+            push!(badenfs, trialnum)
+            continue
+        end
+
+        dt = DateTime(m[:timestring], df)
+        push!(trialctime, dt)
+    end
+
+    deleteat!(trials, badenfs)
+
+    order = sortperm(trialctime)
+
+    return map(x -> basename(x[1:end-10]), trials[order])
+end
+
+function analyzetrial(pinf, numstrides)
+    cols = [ "TrunkLinVel", "TrunkAngVel", "RFootPos", "LFootPos", "ModelAngMmntm", "COG" ]
+    fs = 100
+
+    results = Dict{Symbol,Any}()
+
+    tmp = readsegment(PerturbSeg, pinf.trial, 0.0; events=[:RFC, :LFC])
+    pre_lastrfc = findlast(x -> x < pinf.conds[:pst], tmp.data.events[:RFC])
+    post_firstrfc = findfirst(x -> x > pinf.conds[:pst], tmp.data.events[:RFC])
+    
+    seg = readsegment(PerturbSeg, pinf.trial, tmp.data.events[:RFC][pre_lastrfc - numstrides] - 0.01,
+                        tmp.data.events[:RFC][post_firstrfc + numstrides + 1] + 0.01;
+                        events=[:RFC, :LFC, :RFO], ts=cols)
+
+    # adjust time
+    pst = pinf.conds[:pst] - (tmp.data.events[:RFC][pre_lastrfc - numstrides] - 0.01)
+
+    ########################################
+    ## Interleaving steps
+    ########################################
+
+    # Gather rfc and lfc info into a NamedTuple, with named fields `time`, `pos`, and `leg`, (`:RFC` or `:LFC`)
+    rfc = [ (time=seg.data.events[:RFC][i],
+             pos=SVector{2}(seg.data.data[:RFootPos][
+                    round(Int, seg.data.events[:RFC][i]*fs)
+                    ,1:2]),
+             leg=:RFC) for i in 1:length(seg.data.events[:RFC]) ]
+    if seg.data.events[:LFC][1] < seg.data.events[:RFC][1]
+        lfc = [ (time=seg.data.events[:LFC][i],
+                 pos=SVector{2}(seg.data.data[:LFootPos][
+                        round(Int, seg.data.events[:LFC][i]*fs)
+                        ,1:2]),
+                 leg=:LFC) for i in 2:length(seg.data.events[:LFC]) ]
+    else
+        lfc = [ (time=seg.data.events[:LFC][i],
+                 pos=SVector{2}(seg.data.data[:LFootPos][
+                        round(Int, seg.data.events[:LFC][i]*fs)
+                        ,1:2]),
+                 leg=:LFC) for i in 1:length(seg.data.events[:LFC]) ]
+    end
+
+    # Sort all steps
+    steps = sort([rfc; lfc], by=(x -> x.time))
+    
+    # Interleave foot contact and foot off events, verify correct ordering, etc.
+    rfevents = sort([
+            [ (time=seg.data.events[:RFC][i], event=:RFC) for i in 1:(numstrides+1)*2 ];
+            [ (time=seg.data.events[:RFO][i], event=:RFO) for i in 1:(numstrides+1)*2 ]
+        ], by=(x -> x.time))
+    if rfevents[1].event === :RFO
+        rfevents = rfevents[2:end] # rfevents should start with an :RFC
+    end
+    all(x -> x.event === :RFC, rfevents[isodd.(axes(rfevents, 1))]) || throw(DomainError("Odd elements aren't all RFC's"))
+    all(x -> x.event === :RFO, rfevents[iseven.(axes(rfevents, 1))]) || throw(DomainError("Even elements aren't all RFO's"))
+
+    pre_steps = filter(x -> x.time < pst, steps)
+    post_steps = filter(x -> x.time >= pst, steps)
+    if post_steps[1].leg === :LFC
+        # :pst is the time when the CAREN software (D-Flow) triggers the perturbation,
+        # but due to a lag between the software commands and the physical response of the
+        # system, there may be a :LFC in between. Since the right belt is the perturbed belt,
+        # the actual start of the perturbation, as experienced by a subject, is the first
+        # :RFC following :pst
+        post_steps = post_steps[2:end]
+    end
+
+    pre_rfevents = filter(x -> x.time < pst, rfevents)
+    post_rfevents = filter(x -> x.time >= pst, rfevents)
+    if post_rfevents[1].event === :RFO
+        # same reasoning as above
+        post_rfevents = post_rfevents[2:end]
+    end
+
+    pre_rfc = filter(x -> x.time < pst, rfc)
+    post_rfc = filter(x -> x.time >= pst, rfc)
+    
+    ########################################
+    ## Gait variability
+    ########################################
+
+    # due to the presence of double-steps, step metrics are collectively
+    # summarized (instead of bilateral reporting when it would be  unclear
+    # how double-steps should be handled)
+    results[:pre_steptimes] = diff(getindex.(pre_steps, :time))
+    results[:pre_stridetimes] = diff(getindex.(pre_rfc, :time))
+    results[:pre_stepfoot] = getindex.(pre_steps, :leg)[2:end]
+
+    results[:post_steptimes] = diff(getindex.(post_steps, :time))
+    results[:post_stridetimes] = diff(getindex.(post_rfc, :time))
+    results[:post_stepfoot] = getindex.(post_steps, :leg)[2:end]
+
+    # Step width isn't confounded by induced asymmetric gait
+    results[:pre_stepwidth] = abs.(getindex.(diff(getindex.(pre_steps, :pos)), 1))
+    results[:post_stepwidth] = abs.(getindex.(diff(getindex.(post_steps, :pos)), 1))
+    
+    pre_stanceswing = diff(getindex.(pre_rfevents, :time))
+    post_stanceswing = diff(getindex.(post_rfevents, :time))
+    results[:pre_stancetime] = pre_stanceswing[isodd.(axes(pre_stanceswing,1))]
+    results[:pre_swingtime] = pre_stanceswing[iseven.(axes(pre_stanceswing,1))]
+
+    results[:post_stancetime] = post_stanceswing[isodd.(axes(post_stanceswing,1))]
+    results[:post_swingtime] = post_stanceswing[iseven.(axes(post_stanceswing,1))]
+
+    ########################################
+    ## LV and AV reductions
+    ########################################
+
+    LV = seg.data.data[:TrunkLinVel]
+    AV = seg.data.data[:TrunkAngVel]
+
+    pre_stridergs = [ round(Int, pre_rfc[i].time*fs):(round(Int, pre_rfc[i+1].time*fs)-1) 
+                    for i in 1:numstrides ]
+    post_stridergs = [ round(Int, post_rfc[i].time*fs):(round(Int, post_rfc[i+1].time*fs)-1) 
+                    for i in 1:numstrides ]
+
+    results[:pre_lvmean] = [ vec(mean(view(LV, rg, :); dims=1)) for rg in pre_stridergs ]
+    results[:pre_avmean] = [ vec(mean(view(AV, rg, :); dims=1)) for rg in pre_stridergs ]
+
+    results[:pre_lvstd] = [ vec(std(view(LV, rg, :); dims=1)) for rg in pre_stridergs ]
+    results[:pre_avstd] = [ vec(std(view(AV, rg, :); dims=1)) for rg in pre_stridergs ]
+
+    results[:pre_lvrms] = [ @views [ rms(LV[rg,1]), rms(LV[rg,2]), rms(LV[rg,3]) ] for rg in pre_stridergs ]
+    results[:pre_avrms] = [ @views [ rms(AV[rg,1]), rms(AV[rg,2]), rms(AV[rg,3]) ] for rg in pre_stridergs ]
+
+    results[:pre_lvmax] = [ vec(maximum(view(LV, rg, :); dims=1)) for rg in pre_stridergs ]
+    results[:pre_avmax] = [ vec(maximum(view(AV, rg, :); dims=1)) for rg in pre_stridergs ]
+
+    results[:pre_lvmin] = [ vec(minimum(view(LV, rg, :); dims=1)) for rg in pre_stridergs ]
+    results[:pre_avmin] = [ vec(minimum(view(AV, rg, :); dims=1)) for rg in pre_stridergs ]
+    
+    results[:post_lvmean] = [ vec(mean(view(LV, rg, :); dims=1)) for rg in post_stridergs ]
+    results[:post_avmean] = [ vec(mean(view(AV, rg, :); dims=1)) for rg in post_stridergs ]
+
+    results[:post_lvstd] = [ vec(std(view(LV, rg, :); dims=1)) for rg in post_stridergs ]
+    results[:post_avstd] = [ vec(std(view(AV, rg, :); dims=1)) for rg in post_stridergs ]
+
+    results[:post_lvrms] = [ @views [ rms(LV[rg,1]), rms(LV[rg,2]), rms(LV[rg,3]) ] for rg in post_stridergs ]
+    results[:post_avrms] = [ @views [ rms(AV[rg,1]), rms(AV[rg,2]), rms(AV[rg,3]) ] for rg in post_stridergs ]
+
+    results[:post_lvmax] = [ vec(maximum(view(LV, rg, :); dims=1)) for rg in post_stridergs ]
+    results[:post_avmax] = [ vec(maximum(view(AV, rg, :); dims=1)) for rg in post_stridergs ]
+
+    results[:post_lvmin] = [ vec(minimum(view(LV, rg, :); dims=1)) for rg in post_stridergs ]
+    results[:post_avmin] = [ vec(minimum(view(AV, rg, :); dims=1)) for rg in post_stridergs ]
+    
+    ########################################
+    ## AngMom reductions
+    ########################################
+
+    AM = seg.data.data[:ModelAngMmntm][3:end-2,:]
+
+    results[:pre_angmom_mean] = [ vec(mean(view(AM, rg, :); dims=1)) for rg in pre_stridergs ]
+
+    results[:pre_angmom_std] = [ vec(std(view(AM, rg, :); dims=1)) for rg in pre_stridergs ]
+
+    results[:pre_angmom_rms] = [ @views [ rms(AM[rg,1]), rms(AM[rg,2]), rms(AM[rg,3]) ] for rg in pre_stridergs ]
+
+    results[:pre_angmom_max] = [ vec(maximum(view(AM, rg, :); dims=1)) for rg in pre_stridergs ]
+
+    results[:pre_angmom_min] = [ vec(minimum(view(AM, rg, :); dims=1)) for rg in pre_stridergs ]
+
+    results[:post_angmom_mean] = [ vec(mean(view(AM, rg, :); dims=1)) for rg in post_stridergs ]
+
+    results[:post_angmom_std] = [ vec(std(view(AM, rg, :); dims=1)) for rg in post_stridergs ]
+
+    results[:post_angmom_rms] = [ @views [ rms(AM[rg,1]), rms(AM[rg,2]), rms(AM[rg,3]) ] for rg in post_stridergs ]
+
+    results[:post_angmom_max] = [ vec(maximum(view(AM, rg, :); dims=1)) for rg in post_stridergs ]
+
+    results[:post_angmom_min] = [ vec(minimum(view(AM, rg, :); dims=1)) for rg in post_stridergs ]
+
+    ########################################
+    ## COM reductions
+    ########################################
+
+    COM = seg.data.data[:COG][3:end-2,:]
+
+    results[:pre_com_mean] = [ vec(mean(view(COM, rg, :); dims=1)) for rg in pre_stridergs ]
+
+    results[:pre_com_std] = [ vec(std(view(COM, rg, :); dims=1)) for rg in pre_stridergs ]
+
+    results[:pre_com_rms] = [ @views [ rms(COM[rg,1]), rms(COM[rg,2]), rms(COM[rg,3]) ] for rg in pre_stridergs ]
+
+    results[:pre_com_max] = [ vec(maximum(view(COM, rg, :); dims=1)) for rg in pre_stridergs ]
+
+    results[:pre_com_min] = [ vec(minimum(view(COM, rg, :); dims=1)) for rg in pre_stridergs ]
+
+    results[:post_com_mean] = [ vec(mean(view(COM, rg, :); dims=1)) for rg in post_stridergs ]
+
+    results[:post_com_std] = [ vec(std(view(COM, rg, :); dims=1)) for rg in post_stridergs ]
+
+    results[:post_com_rms] = [ @views [ rms(COM[rg,1]), rms(COM[rg,2]), rms(COM[rg,3]) ] for rg in post_stridergs ]
+
+    results[:post_com_max] = [ vec(maximum(view(COM, rg, :); dims=1)) for rg in post_stridergs ]
+
+    results[:post_com_min] = [ vec(minimum(view(COM, rg, :); dims=1)) for rg in post_stridergs ]
+    
+    return AnalyzedSegment(pinf, results)
+end
+
 
 end # module
